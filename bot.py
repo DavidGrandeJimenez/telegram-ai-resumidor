@@ -11,6 +11,7 @@ from telegram import InlineKeyboardMarkup
 
 from telethon import TelegramClient
 from telethon.tl import functions
+from telethon.sessions import StringSession
 
 from google import genai
 
@@ -39,8 +40,13 @@ CHATS_EXCLUIDOS = [
     -1001245852070
 ]
 
+telegram_session = os.getenv("TELEGRAM_SESSION")
 
-telegram_client = TelegramClient("mi_sesion_telegram", API_ID, API_HASH)
+telegram_client = TelegramClient(
+    StringSession(telegram_session),
+    API_ID,
+    API_HASH
+)
 
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
