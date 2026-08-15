@@ -19,6 +19,7 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MAX_TOKENS_GEMINI = 3000
 CHATS_EXCLUIDOS = [
     8989055191,
     -1001644369540,
@@ -67,6 +68,153 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("¿Qué chat quieres resumir?", reply_markup=teclado)
 
+def dividir_texto(texto, max_tokens=15000):
+    max_caracteres = max_tokens * 4
+
+    bloques = []
+    bloque_actual = ""
+    
+    mensajes = texto.split("\n\n")
+
+    for mensaje in mensajes:
+        if not mensaje.strip():
+            continue
+
+        if len(bloque_actual) + len(mensaje) + 2 <= max_caracteres:
+            bloque_actual += mensaje + "\n\n"
+        else:
+            if bloque_actual:
+                bloques.append(bloque_actual.strip())
+
+            bloque_actual = mensaje + "\n\n"
+
+    if bloque_actual:
+        bloques.append(bloque_actual.strip())
+
+    return bloques
+def generar_resumen_parcial(texto):
+    respuesta = gemini_client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=(
+            "Analiza esta parte de una conversación de Telegram.\n\n"
+
+            "Extrae toda la información relevante que pueda ser "
+            "necesaria para construir posteriormente un resumen "
+            "completo de la conversación.\n\n"
+
+            "Identifica:\n"
+            "- Resumen de esta parte.\n"
+            "- Temas principales.\n"
+            "- Decisiones realmente tomadas.\n"
+            "- Preguntas y sus respuestas, directas o indirectas.\n\n"
+
+            "No inventes información.\n"
+            "Si una pregunta no tiene respuesta en esta parte, "
+            "indica que no se ha respondido en esta parte.\n\n"
+
+            "Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:\n"
+            "{\n"
+            '  "resumen": "Resumen de esta parte",\n'
+            '  "temas_principales": ["tema 1"],\n'
+            '  "decisiones": ["decisión 1"],\n'
+            '  "preguntas_y_respuestas": [\n'
+            '    {\n'
+            '      "pregunta": "Pregunta",\n'
+            '      "respuesta": "Respuesta o '
+            'No se ha respondido en esta parte."\n'
+            '    }\n'
+            '  ]\n'
+            "}\n\n"
+
+            "CONVERSACIÓN:\n"
+            + texto
+        ),
+        config={
+            "response_mime_type": "application/json"
+        }
+    )
+
+    return respuesta.text
+def generar_resumen_final(resumenes_parciales):
+    texto_resumenes = "\n\n--- SIGUIENTE BLOQUE ---\n\n".join(
+        resumenes_parciales
+    )
+
+    respuesta = gemini_client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=(
+            "Has recibido varios análisis parciales de una conversación "
+            "de Telegram.\n\n"
+
+            "Combina todos los análisis en un único resumen final "
+            "coherente y sin duplicaciones.\n\n"
+
+            "Debes:\n"
+            "- Crear un resumen general de toda la conversación.\n"
+            "- Unificar los temas principales.\n"
+            "- Identificar únicamente las decisiones realmente tomadas.\n"
+            "- Unificar preguntas repetidas.\n"
+            "- Relacionar preguntas con sus respuestas aunque la pregunta "
+            "y la respuesta aparezcan en bloques diferentes.\n"
+            "- Si una pregunta no tiene respuesta en ningún bloque, "
+            "indicar que no se ha respondido.\n\n"
+
+            "No inventes información.\n"
+            "No incluyas acciones pendientes.\n\n"
+
+            "Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:\n"
+            "{\n"
+            '  "resumen": "Resumen general",\n'
+            '  "temas_principales": ["tema 1", "tema 2"],\n'
+            '  "decisiones": ["decisión 1"],\n'
+            '  "preguntas_y_respuestas": [\n'
+            '    {\n'
+            '      "pregunta": "Pregunta",\n'
+            '      "respuesta": "Respuesta o No se ha respondido."\n'
+            '    }\n'
+            '  ]\n'
+            "}\n\n"
+
+            "ANÁLISIS PARCIALES:\n"
+            + texto_resumenes
+        ),
+        config={
+            "response_mime_type": "application/json"
+        }
+    )
+
+    return respuesta.text
+def generar_resumen_inteligente(texto):
+    tokens_estimados = estimar_tokens(texto)
+
+    if tokens_estimados <= MAX_TOKENS_GEMINI:
+        return generar_resumen(texto)
+
+    bloques = dividir_texto(texto)
+
+    print(
+        f"Conversación demasiado grande: "
+        f"{tokens_estimados} tokens estimados."
+    )
+
+    print(
+        f"Se dividirá en {len(bloques)} bloques."
+    )
+
+    resumenes_parciales = []
+
+    for i, bloque in enumerate(bloques, start=1):
+        print(
+            f"Procesando bloque {i}/{len(bloques)}..."
+        )
+
+        resumen_parcial = generar_resumen_parcial(bloque)
+
+        resumenes_parciales.append(resumen_parcial)
+
+    print("Generando resumen final...")
+
+    return generar_resumen_final(resumenes_parciales)
 
 def generar_resumen(texto):
     respuesta = gemini_client.models.generate_content(
@@ -130,6 +278,24 @@ def generar_resumen(texto):
 
     return respuesta.text
 
+def filtrar_mensajes(messages):
+    mensajes_filtrados = []
+
+    for message in messages:
+        if not message.message:
+            continue
+
+        texto = message.message.strip()
+
+        if not texto:
+            continue
+
+        mensajes_filtrados.append(message)
+
+    return mensajes_filtrados
+
+def estimar_tokens(texto):
+    return max(1, len(texto) // 4)
 
 async def seleccionar_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -155,25 +321,43 @@ async def seleccionar_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"{chat.name}\n\nNo tienes mensajes sin leer.")
         return
 
+    print(f"Unread count: {chat.unread_count}")
+
     mensajes = []
 
     async for mensaje in telegram_client.iter_messages(
-        chat.entity, limit=chat.unread_count
+        chat.entity,
+        limit=chat.unread_count
     ):
-        if mensaje.text:
-            mensajes.append(mensaje)
-
+        mensajes.append(mensaje)
+    print(f"Mensajes obtenidos antes del filtro: {len(mensajes)}")
+    
     mensajes.reverse()
+
+    mensajes = filtrar_mensajes(mensajes)
 
     texto = ""
 
-    for mensaje in mensajes:
-        texto += mensaje.text + "\n\n"
+    for cadaMensaje in mensajes:
+        texto += cadaMensaje.message.strip() + "\n\n"
 
-    await query.edit_message_text("Estoy preparando el resumen...")
+    tokens_estimados = estimar_tokens(texto)
+   
+    print(
+        f"Mensajes sin leer: {chat.unread_count} | "
+        f"Mensajes con texto: {len(mensajes)} | "
+        f"Caracteres enviados: {len(texto)} | "
+        f"Tokens estimados: {tokens_estimados}"
+    )
 
-    resumen_json = await asyncio.to_thread(generar_resumen, texto)
+    await query.edit_message_text(
+        "Estoy preparando el resumen..."
+    )
 
+    resumen_json = await asyncio.to_thread(
+        generar_resumen_inteligente,
+        texto
+    )
 
     datos = json.loads(resumen_json)
 
