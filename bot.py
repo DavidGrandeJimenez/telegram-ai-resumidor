@@ -666,7 +666,7 @@ async def seleccionar_chat(update, context):
 
 
 async def main():
-    await telegram_client.start()
+    await telegram_client.connect()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
