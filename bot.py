@@ -1,13 +1,16 @@
 import os
 import asyncio
 import json
-
+import traceback
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import InlineKeyboardButton
+from telegram import InlineKeyboardMarkup
 
 from telethon import TelegramClient
+from telethon.tl import functions
 
 from google import genai
 
@@ -19,7 +22,8 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MAX_TOKENS_GEMINI = 3000
+MAX_TOKENS_GEMINI = 10000
+GEMINI_ACTIVO = True
 CHATS_EXCLUIDOS = [
     8989055191,
     -1001644369540,
@@ -47,6 +51,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Hola. Usa /resumen para resumir los mensajes sin leer."
     )
 
+async def enviar_error_telegram(update, error):
+    try:
+        mensaje = (
+            "🚨 ERROR EN EL BOT\n\n"
+            f"Tipo: {type(error).__name__}\n"
+            f"Mensaje: {str(error)}\n\n"
+            "Detalles:\n"
+            f"{traceback.format_exc()}"
+        )
+
+        # Telegram limita el tamaño de los mensajes
+        if len(mensaje) > 4000:
+            mensaje = mensaje[:4000]
+
+        if update and update.effective_chat:
+            await update.effective_chat.send_message(mensaje)
+
+    except Exception as error_envio:
+        print(f"No se pudo enviar el error a Telegram: {error_envio}")
 
 async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dialogs = await telegram_client.get_dialogs(limit=20)
@@ -297,10 +320,216 @@ def filtrar_mensajes(messages):
 def estimar_tokens(texto):
     return max(1, len(texto) // 4)
 
-async def seleccionar_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+async def diagnosticar_chat(chat):
+    print("\n========== DIAGNÓSTICO DEL CHAT ==========")
 
+    print(f"Nombre: {chat.name}")
+    print(f"ID: {chat.id}")
+    print(f"Tipo: {type(chat.entity).__name__}")
+
+    print(f"Unread count: {chat.unread_count}")
+
+    entity = chat.entity
+
+    print(f"Entity ID: {getattr(entity, 'id', None)}")
+    print(f"Username: {getattr(entity, 'username', None)}")
+    print(f"Title: {getattr(entity, 'title', None)}")
+    print(f"Megagroup: {getattr(entity, 'megagroup', None)}")
+    print(f"Broadcast: {getattr(entity, 'broadcast', None)}")
+
+    print("\nAtributos relacionados con topics/discusiones:")
+
+    atributos = [
+        "forum",
+        "linked_chat_id",
+        "discussion",
+        "megagroup",
+        "broadcast"
+    ]
+
+    for atributo in atributos:
+        print(
+            f"{atributo}: "
+            f"{getattr(entity, atributo, None)}"
+        )
+
+    print("==========================================\n")
+
+async def obtener_topics(chat):
+    resultado = await telegram_client(
+        functions.messages.GetForumTopicsRequest(
+            peer=chat.entity,
+            q="",
+            offset_date=None,
+            offset_id=0,
+            offset_topic=0,
+            limit=100
+        )
+    )
+
+    return resultado.topics
+
+async def error_handler(update, context):
+    error = context.error
+
+    print("ERROR:")
+    traceback.print_exception(
+        type(error),
+        error,
+        error.__traceback__
+    )
+
+    await enviar_error_telegram(update, error)
+
+async def obtener_mensajes_topic(chat, topic_id):
+
+    mensajes = []
+    offset_id = 0
+
+    while True:
+
+        resultado = await telegram_client(
+            functions.messages.GetRepliesRequest(
+                peer=chat.entity,
+                msg_id=topic_id,
+                offset_id=offset_id,
+                offset_date=None,
+                add_offset=0,
+                limit=100,
+                max_id=0,
+                min_id=0,
+                hash=0
+            )
+        )
+
+        nuevos = [
+            mensaje
+            for mensaje in resultado.messages
+            if mensaje.message
+        ]
+
+        if not nuevos:
+            break
+
+        mensajes.extend(nuevos)
+
+        print(
+            f"Mensajes recuperados del Topic: "
+            f"{len(mensajes)}"
+        )
+
+        # El último mensaje de este bloque
+        # será nuestro nuevo punto de paginación
+        ultimo_id = resultado.messages[-1].id
+
+        if ultimo_id == offset_id:
+            break
+
+        offset_id = ultimo_id
+
+        # Si hemos recibido menos de 100,
+        # probablemente hemos llegado al final
+        if len(resultado.messages) < 100:
+            break
+
+    # Evitar duplicados por seguridad
+    mensajes_unicos = {
+        mensaje.id: mensaje
+        for mensaje in mensajes
+    }
+
+    mensajes = list(mensajes_unicos.values())
+
+    mensajes.sort(key=lambda mensaje: mensaje.id)
+
+    return mensajes
+
+
+async def diagnosticar_topic(chat, topic_id):
+    print("\n========== DIAGNÓSTICO DEL TOPIC ==========")
+    print(f"Chat ID: {chat.id}")
+    print(f"Topic ID: {topic_id}")
+
+    try:
+        resultado = await telegram_client(
+            functions.messages.GetRepliesRequest(
+                peer=chat.entity,
+                msg_id=topic_id,
+                offset_id=0,
+                offset_date=None,
+                add_offset=0,
+                limit=100,
+                max_id=0,
+                min_id=0,
+                hash=0
+            )
+        )
+
+        print(f"Mensajes recibidos: {len(resultado.messages)}")
+        print(f"Total indicado por Telegram: {getattr(resultado, 'count', 'desconocido')}")
+
+        for mensaje in resultado.messages:
+            print(
+                f"ID: {mensaje.id} | "
+                f"Texto: {(mensaje.message or '')[:100]}"
+            )
+
+    except Exception as e:
+        print(f"ERROR: {type(e).__name__}: {e}")
+
+    print("===========================================\n")
+
+async def seleccionar_chat(update, context):
+    query = update.callback_query
     await query.answer()
+
+    if query.data.startswith("topic:"):
+        partes = query.data.split(":")
+
+        chat_id = int(partes[1])
+        topic_id = int(partes[2])
+
+        print(f"Topic seleccionado: {topic_id}")
+        print(f"Chat seleccionado: {chat_id}")
+
+        chat = None
+
+        dialogs = await telegram_client.get_dialogs(limit=20)
+
+        for dialog in dialogs:
+            if dialog.id == chat_id:
+                chat = dialog
+                break
+
+        if chat is None:
+            await query.edit_message_text(
+                "No he podido encontrar ese chat."
+            )
+            return
+
+        await query.edit_message_text(
+            "🔎 Probando acceso al Topic..."
+        )
+
+        mensajes = await obtener_mensajes_topic(chat, topic_id)
+
+        print(f"Mensajes obtenidos del Topic: {len(mensajes)}")
+
+        caracteres = sum(
+            len(mensaje.message)
+            for mensaje in mensajes
+        )
+
+        print(f"Caracteres: {caracteres}")
+
+        await query.edit_message_text(
+            f"✅ Topic encontrado\n\n"
+            f"Chat: {chat.name}\n"
+            f"Topic ID: {topic_id}\n\n"
+            "Mira el resultado en la terminal."
+        )
+
+        return
 
     chat_id = int(query.data.replace("chat_", ""))
 
@@ -315,6 +544,47 @@ async def seleccionar_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat is None:
         await query.edit_message_text("No he podido encontrar ese chat.")
+        return
+
+    await diagnosticar_chat(chat)
+
+    if getattr(chat.entity, "forum", False):
+        topics = await obtener_topics(chat)
+
+        botones = []
+
+        for topic in topics:
+            botones.append(
+                [
+                    InlineKeyboardButton(
+                        topic.title,
+                        callback_data=f"topic:{chat.id}:{topic.id}"
+                    )
+                ]
+            )
+
+        if not botones:
+            await query.edit_message_text(
+                f"{chat.name}\n\nNo he encontrado ningún tema."
+            )
+            return
+
+        botones.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Volver",
+                    callback_data="volver_chats"
+                )
+            ]
+        )
+
+        await query.edit_message_text(
+            f"📂 {chat.name}\n\n"
+            "Este grupo utiliza temas.\n"
+            "Selecciona el tema que quieres resumir:",
+            reply_markup=InlineKeyboardMarkup(botones)
+        )
+
         return
 
     if chat.unread_count == 0:
@@ -354,6 +624,13 @@ async def seleccionar_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Estoy preparando el resumen..."
     )
 
+    if not GEMINI_ACTIVO:
+        await query.edit_message_text(
+            "⚠️ Gemini está desactivado temporalmente.\n\n"
+            "La conversación se ha obtenido correctamente."
+        )
+        return
+
     resumen_json = await asyncio.to_thread(
         generar_resumen_inteligente,
         texto
@@ -386,6 +663,8 @@ async def main():
     await telegram_client.start()
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
 
