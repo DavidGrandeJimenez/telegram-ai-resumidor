@@ -14,9 +14,14 @@ from telethon.tl import functions
 from telethon.sessions import StringSession
 
 from google import genai
-
+import json
+from google.genai.errors import ServerError
+import time
 
 load_dotenv()
+
+# Lista de modelos por orden de preferencia
+MODELOS_PREFERIDOS = ["gemini-3.6-flash"]
 
 
 API_ID = int(os.getenv("API_ID"))
@@ -122,97 +127,155 @@ def dividir_texto(texto, max_tokens=15000):
 
     return bloques
 def generar_resumen_parcial(texto):
-    respuesta = gemini_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=(
-            "Analiza esta parte de una conversación de Telegram.\n\n"
+  prompt = (
+      "Analiza esta parte de una conversación de Telegram.\n\n"
+      "Extrae toda la información relevante que pueda ser "
+      "necesaria para construir posteriormente un resumen "
+      "completo de la conversación.\n\n"
+      "Identifica:\n"
+      "- Resumen de esta parte.\n"
+      "- Temas principales.\n"
+      "- Decisiones realmente tomadas.\n"
+      "- Preguntas y sus respuestas, directas o indirectas.\n\n"
+      "No inventes información.\n"
+      "Si una pregunta no tiene respuesta en esta parte, "
+      "indica que no se ha respondido en esta parte.\n\n"
+      "Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:\n"
+      "{\n"
+      '  "resumen": "Resumen de esta parte",\n'
+      '  "temas_principales": ["tema 1"],\n'
+      '  "decisiones": ["decisión 1"],\n'
+      '  "preguntas_y_respuestas": [\n'
+      "    {\n"
+      '      "pregunta": "Pregunta",\n'
+      '      "respuesta": "Respuesta o No se ha respondido en esta parte."\n'
+      "    }\n"
+      "  ]\n"
+      "}\n\n"
+      "CONVERSACIÓN:\n" + texto
+  )
 
-            "Extrae toda la información relevante que pueda ser "
-            "necesaria para construir posteriormente un resumen "
-            "completo de la conversación.\n\n"
+  respuesta = None
+  for modelo in MODELOS_PREFERIDOS:
+    try:
+      print(f"Intentando con el modelo: {modelo}...")
+      respuesta = gemini_client.models.generate_content(
+          model=modelo,
+          contents=prompt,
+          config={"response_mime_type": "application/json"},
+      )
+      break  # Si tiene éxito, salimos del bucle
+    except ServerError:
+      print(
+          f"El modelo {modelo} está saturado. Esperando 2 segundos para"
+          " reintentar..."
+      )
+      time.sleep(2)  # Pausa breve antes de probar el siguiente modelo
+      continue  # Si da error 503, prueba con el siguiente modelo
+    except Exception as e:
+      print(f"Ocurrió un error: {e}")
+      continue
 
-            "Identifica:\n"
-            "- Resumen de esta parte.\n"
-            "- Temas principales.\n"
-            "- Decisiones realmente tomadas.\n"
-            "- Preguntas y sus respuestas, directas o indirectas.\n\n"
-
-            "No inventes información.\n"
-            "Si una pregunta no tiene respuesta en esta parte, "
-            "indica que no se ha respondido en esta parte.\n\n"
-
-            "Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:\n"
-            "{\n"
-            '  "resumen": "Resumen de esta parte",\n'
-            '  "temas_principales": ["tema 1"],\n'
-            '  "decisiones": ["decisión 1"],\n'
-            '  "preguntas_y_respuestas": [\n'
-            '    {\n'
-            '      "pregunta": "Pregunta",\n'
-            '      "respuesta": "Respuesta o '
-            'No se ha respondido en esta parte."\n'
-            '    }\n'
-            '  ]\n'
-            "}\n\n"
-
-            "CONVERSACIÓN:\n"
-            + texto
+  if respuesta is None:
+    return {
+        "resumen": (
+            "⚠️ Los servidores están experimentando alta demanda. Inténtalo de"
+            " nuevo."
         ),
-        config={
-            "response_mime_type": "application/json"
-        }
-    )
+        "temas_principales": [],
+        "decisiones": [],
+        "preguntas_y_respuestas": [],
+    }
 
-    return respuesta.text
+  try:
+    return json.loads(respuesta.text)
+  except json.JSONDecodeError:
+    return {
+        "resumen": respuesta.text,
+        "temas_principales": [],
+        "decisiones": [],
+        "preguntas_y_respuestas": [],
+    }
+    
 def generar_resumen_final(resumenes_parciales):
-    texto_resumenes = "\n\n--- SIGUIENTE BLOQUE ---\n\n".join(
-        resumenes_parciales
-    )
+  texto_resumenes = "\n\n--- SIGUIENTE BLOQUE ---\n\n".join(
+      json.dumps(r, ensure_ascii=False) if isinstance(r, dict) else str(r)
+      for r in resumenes_parciales
+  )
 
-    respuesta = gemini_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=(
-            "Has recibido varios análisis parciales de una conversación "
-            "de Telegram.\n\n"
+  prompt = (
+      "Has recibido varios análisis parciales de una conversación "
+      "de Telegram.\n\n"
+      "Combina todos los análisis en un único resumen final "
+      "coherente y sin duplicaciones.\n\n"
+      "Debes:\n"
+      "- Crear un resumen general de toda la conversación.\n"
+      "- Unificar los temas principales.\n"
+      "- Identificar únicamente las decisiones realmente tomadas.\n"
+      "- Unificar preguntas repetidas.\n"
+      "- Relacionar preguntas con sus respuestas aunque la pregunta "
+      "y la respuesta aparezcan en bloques diferentes.\n"
+      "- Si una pregunta no tiene respuesta en ningún bloque, "
+      "indicar que no se ha respondido.\n\n"
+      "No inventes información.\n"
+      "No incluyas acciones pendientes.\n\n"
+      "Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:\n"
+      "{\n"
+      '  "resumen": "Resumen general",\n'
+      '  "temas_principales": ["tema 1", "tema 2"],\n'
+      '  "decisiones": ["decisión 1"],\n'
+      '  "preguntas_y_respuestas": [\n'
+      "    {\n"
+      '      "pregunta": "Pregunta",\n'
+      '      "respuesta": "Respuesta o No se ha respondido."\n'
+      "    }\n"
+      "  ]\n"
+      "}\n\n"
+      "ANÁLISIS PARCIALES:\n" + texto_resumenes
+  )
 
-            "Combina todos los análisis en un único resumen final "
-            "coherente y sin duplicaciones.\n\n"
+  respuesta = None
+  for modelo in MODELOS_PREFERIDOS:
+    try:
+      print(f"Intentando con el modelo: {modelo}...")
+      respuesta = gemini_client.models.generate_content(
+          model=modelo,
+          contents=prompt,
+          config={"response_mime_type": "application/json"},
+      )
+      break
+    except ServerError:
+      print(
+          f"El modelo {modelo} está saturado. Esperando 2 segundos para"
+          " reintentar..."
+      )
+      time.sleep(2)  # Pausa breve antes de probar el siguiente modelo
+      continue
+    except Exception as e:
+      print(f"Ocurrió un error: {e}")
+      continue
 
-            "Debes:\n"
-            "- Crear un resumen general de toda la conversación.\n"
-            "- Unificar los temas principales.\n"
-            "- Identificar únicamente las decisiones realmente tomadas.\n"
-            "- Unificar preguntas repetidas.\n"
-            "- Relacionar preguntas con sus respuestas aunque la pregunta "
-            "y la respuesta aparezcan en bloques diferentes.\n"
-            "- Si una pregunta no tiene respuesta en ningún bloque, "
-            "indicar que no se ha respondido.\n\n"
-
-            "No inventes información.\n"
-            "No incluyas acciones pendientes.\n\n"
-
-            "Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:\n"
-            "{\n"
-            '  "resumen": "Resumen general",\n'
-            '  "temas_principales": ["tema 1", "tema 2"],\n'
-            '  "decisiones": ["decisión 1"],\n'
-            '  "preguntas_y_respuestas": [\n'
-            '    {\n'
-            '      "pregunta": "Pregunta",\n'
-            '      "respuesta": "Respuesta o No se ha respondido."\n'
-            '    }\n'
-            '  ]\n'
-            "}\n\n"
-
-            "ANÁLISIS PARCIALES:\n"
-            + texto_resumenes
+  if respuesta is None:
+    return {
+        "resumen": (
+            "⚠️ Los servidores están experimentando alta demanda. Inténtalo de"
+            " nuevo."
         ),
-        config={
-            "response_mime_type": "application/json"
-        }
-    )
+        "temas_principales": [],
+        "decisiones": [],
+        "preguntas_y_respuestas": [],
+    }
 
-    return respuesta.text
+  try:
+    return json.loads(respuesta.text)
+  except json.JSONDecodeError:
+    return {
+        "resumen": respuesta.text,
+        "temas_principales": [],
+        "decisiones": [],
+        "preguntas_y_respuestas": [],
+    }
+
 def generar_resumen_inteligente(texto):
     tokens_estimados = estimar_tokens(texto)
 
@@ -246,66 +309,90 @@ def generar_resumen_inteligente(texto):
     return generar_resumen_final(resumenes_parciales)
 
 def generar_resumen(texto):
-    respuesta = gemini_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=(
-            "Analiza la siguiente conversación de Telegram y "
-            "genera un resumen en español.\n\n"
+  prompt = (
+      "Analiza la siguiente conversación de Telegram y "
+      "genera un resumen en español.\n\n"
+      "Debes identificar tres elementos:\n\n"
+      "1. TEMAS PRINCIPALES\n"
+      "Identifica los asuntos principales tratados.\n\n"
+      "2. DECISIONES Y PROPUESTAS\n"
+      "Identifica decisiones que realmente se hayan "
+      "tomado durante la conversación. "
+      "incluído propuestas, y recomendaciones. \n\n"
+      "3. PREGUNTAS Y RESPUESTAS\n"
+      "Identifica las preguntas relevantes que aparecen en la "
+      "conversación y exponla sintetizadamente.\n"
+      "Para cada pregunta, busca si existe una respuesta "
+      "posterior, anterior o indirecta dentro de la conversación.\n"
+      "Una respuesta indirecta es válida si permite responder "
+      "razonablemente a la pregunta aunque nadie haya escrito "
+      "literalmente una respuesta directa.\n"
+      "Si no existe ninguna respuesta directa ni indirecta, "
+      "indica claramente que no se ha respondido.\n\n"
+      "No inventes información.\n"
+      "No deduzcas respuestas que no estén suficientemente "
+      "respaldadas por la conversación.\n"
+      "No incluyas acciones pendientes.\n\n"
+      "Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:\n"
+      "{\n"
+      '  "temas_principales": ["tema 1", "tema 2"],\n'
+      '  "decisiones": ["decisión 1", "decisión 2"],\n'
+      '  "preguntas_y_respuestas": [\n'
+      "    {\n"
+      '      "pregunta": "Pregunta realizada",\n'
+      '      "respuesta": "Respuesta encontrada o No se ha respondido."\n'
+      "    }\n"
+      "  ]\n"
+      "}\n\n"
+      "Si no hay información para una categoría, "
+      "devuelve una lista vacía.\n\n"
+      "No incluyas Markdown.\n"
+      "No incluyas texto antes ni después del JSON.\n\n"
+      "CONVERSACIÓN:\n" + texto
+  )
 
-            "Debes identificar tres elementos:\n\n"
+  respuesta = None
+  for modelo in MODELOS_PREFERIDOS:
+    try:
+      print(f"Intentando con el modelo: {modelo}...")
+      respuesta = gemini_client.models.generate_content(
+          model=modelo,
+          contents=prompt,
+          config={"response_mime_type": "application/json"},
+      )
+      break  # Si tiene éxito, salimos del bucle
+    except ServerError:
+      print(
+          f"El modelo {modelo} está saturado. Esperando 2 segundos para"
+          " reintentar..."
+      )
+      time.sleep(2)  # Pausa breve antes de probar el siguiente modelo
+      continue  # Si da error 503, prueba con el siguiente modelo
+    except Exception as e:
+      print(f"Ocurrió un error: {e}")
+      continue
 
-            "1. TEMAS PRINCIPALES\n"
-            "Identifica los asuntos principales tratados.\n\n"
+  # Si ningún modelo respondió correctamente
+  if respuesta is None:
+    return {
+        "temas_principales": [],
+        "decisiones": [
+            "⚠️ Los servidores están experimentando alta demanda (Error 503)."
+            " Inténtalo de nuevo."
+        ],
+        "preguntas_y_respuestas": [],
+    }
 
-            "2. DECISIONES Y PROPUESTAS\n"
-            "Identifica decisiones que realmente se hayan "
-            "tomado durante la conversación. "
-            "incluído propuestas, y recomendaciones. \n\n"
+  # Parseamos el texto devuelto a un diccionario de Python
+  try:
+    return json.loads(respuesta.text)
+  except json.JSONDecodeError:
+    return {
+        "temas_principales": [],
+        "decisiones": [respuesta.text],
+        "preguntas_y_respuetas": [],
+    }
 
-            "3. PREGUNTAS Y RESPUESTAS\n"
-            "Identifica las preguntas relevantes que aparecen en la "
-            "conversación y exponla sintetizadamente.\n"
-            "Para cada pregunta, busca si existe una respuesta "
-            "posterior, anterior o indirecta dentro de la conversación.\n"
-            "Una respuesta indirecta es válida si permite responder "
-            "razonablemente a la pregunta aunque nadie haya escrito "
-            "literalmente una respuesta directa.\n"
-            "Si no existe ninguna respuesta directa ni indirecta, "
-            "indica claramente que no se ha respondido.\n\n"
-
-            "No inventes información.\n"
-            "No deduzcas respuestas que no estén suficientemente "
-            "respaldadas por la conversación.\n"
-            "No incluyas acciones pendientes.\n\n"
-
-            "Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:\n"
-            "{\n"
-            '  "temas_principales": ["tema 1", "tema 2"],\n'
-            '  "decisiones": ["decisión 1", "decisión 2"],\n'
-            '  "preguntas_y_respuestas": [\n'
-            '    {\n'
-            '      "pregunta": "Pregunta realizada",\n'
-            '      "respuesta": "Respuesta encontrada o '
-            'No se ha respondido."\n'
-            '    }\n'
-            '  ]\n'
-            "}\n\n"
-
-            "Si no hay información para una categoría, "
-            "devuelve una lista vacía.\n\n"
-
-            "No incluyas Markdown.\n"
-            "No incluyas texto antes ni después del JSON.\n\n"
-
-            "CONVERSACIÓN:\n"
-            + texto
-        ),
-        config={
-            "response_mime_type": "application/json"
-        }
-    )
-
-    return respuesta.text
 
 def filtrar_mensajes(messages):
     mensajes_filtrados = []
@@ -642,7 +729,7 @@ async def seleccionar_chat(update, context):
         texto
     )
 
-    datos = json.loads(resumen_json)
+    datos = resumen_json
 
     mensaje = f"📝 RESUMEN DE {chat.name}\n\n"
 
