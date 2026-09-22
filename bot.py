@@ -6,30 +6,29 @@ from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram import InlineKeyboardButton
-from telegram import InlineKeyboardMarkup
 
 from telethon import TelegramClient
 from telethon.tl import functions
 from telethon.sessions import StringSession
 
-from google import genai
-import json
-from google.genai.errors import ServerError
 import time
+from openai import OpenAI
 
 load_dotenv()
 
-# Lista de modelos por orden de preferencia
-MODELOS_PREFERIDOS = ["gemini-3.6-flash"]
-
+# Lista ampliada de modelos gratuitos en OpenRouter con rotación automática por saturación
+MODELOS_OPENROUTER = [
+"openrouter/free"
+]
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MAX_TOKENS_GEMINI = 10000
-GEMINI_ACTIVO = True
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+MAX_TOKENS_IA = 10000
+IA_ACTIVA = True
+
 CHATS_EXCLUIDOS = [
     8989055191,
     -1001644369540,
@@ -53,8 +52,10 @@ telegram_client = TelegramClient(
     API_HASH
 )
 
-
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -72,7 +73,6 @@ async def enviar_error_telegram(update, error):
             f"{traceback.format_exc()}"
         )
 
-        # Telegram limita el tamaño de los mensajes
         if len(mensaje) > 4000:
             mensaje = mensaje[:4000]
 
@@ -126,6 +126,29 @@ def dividir_texto(texto, max_tokens=15000):
         bloques.append(bloque_actual.strip())
 
     return bloques
+
+def consultar_ia(prompt):
+    respuesta_texto = None
+
+    # Recorre la lista de modelos gratuitos de OpenRouter uno a uno si fallan o se saturan
+    for modelo in MODELOS_OPENROUTER:
+        try:
+            print(f"Intentando con OpenRouter ({modelo})...")
+            completion = openrouter_client.chat.completions.create(
+                model=modelo,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            respuesta_texto = completion.choices[0].message.content
+            if respuesta_texto:
+                print(f"¡Éxito con el modelo {modelo}!")
+                break
+        except Exception as e:
+            print(f"El modelo {modelo} falló o está saturado: {e}. Probando siguiente...")
+            time.sleep(1)
+
+    return respuesta_texto
+
 def generar_resumen_parcial(texto):
   prompt = (
       "Analiza esta parte de una conversación de Telegram.\n\n"
@@ -155,32 +178,12 @@ def generar_resumen_parcial(texto):
       "CONVERSACIÓN:\n" + texto
   )
 
-  respuesta = None
-  for modelo in MODELOS_PREFERIDOS:
-    try:
-      print(f"Intentando con el modelo: {modelo}...")
-      respuesta = gemini_client.models.generate_content(
-          model=modelo,
-          contents=prompt,
-          config={"response_mime_type": "application/json"},
-      )
-      break  # Si tiene éxito, salimos del bucle
-    except ServerError:
-      print(
-          f"El modelo {modelo} está saturado. Esperando 2 segundos para"
-          " reintentar..."
-      )
-      time.sleep(2)  # Pausa breve antes de probar el siguiente modelo
-      continue  # Si da error 503, prueba con el siguiente modelo
-    except Exception as e:
-      print(f"Ocurrió un error: {e}")
-      continue
+  respuesta_texto = consultar_ia(prompt)
 
-  if respuesta is None:
+  if respuesta_texto is None:
     return {
         "resumen": (
-            "⚠️ Los servidores están experimentando alta demanda. Inténtalo de"
-            " nuevo."
+            "⚠️ Todos los modelos gratuitos de OpenRouter están experimentando alta demanda. Inténtalo de nuevo."
         ),
         "temas_principales": [],
         "decisiones": [],
@@ -188,10 +191,10 @@ def generar_resumen_parcial(texto):
     }
 
   try:
-    return json.loads(respuesta.text)
+    return json.loads(respuesta_texto)
   except json.JSONDecodeError:
     return {
-        "resumen": respuesta.text,
+        "resumen": respuesta_texto,
         "temas_principales": [],
         "decisiones": [],
         "preguntas_y_respuestas": [],
@@ -234,32 +237,12 @@ def generar_resumen_final(resumenes_parciales):
       "ANÁLISIS PARCIALES:\n" + texto_resumenes
   )
 
-  respuesta = None
-  for modelo in MODELOS_PREFERIDOS:
-    try:
-      print(f"Intentando con el modelo: {modelo}...")
-      respuesta = gemini_client.models.generate_content(
-          model=modelo,
-          contents=prompt,
-          config={"response_mime_type": "application/json"},
-      )
-      break
-    except ServerError:
-      print(
-          f"El modelo {modelo} está saturado. Esperando 2 segundos para"
-          " reintentar..."
-      )
-      time.sleep(2)  # Pausa breve antes de probar el siguiente modelo
-      continue
-    except Exception as e:
-      print(f"Ocurrió un error: {e}")
-      continue
+  respuesta_texto = consultar_ia(prompt)
 
-  if respuesta is None:
+  if respuesta_texto is None:
     return {
         "resumen": (
-            "⚠️ Los servidores están experimentando alta demanda. Inténtalo de"
-            " nuevo."
+            "⚠️ Todos los modelos gratuitos de OpenRouter están experimentando alta demanda. Inténtalo de nuevo."
         ),
         "temas_principales": [],
         "decisiones": [],
@@ -267,10 +250,10 @@ def generar_resumen_final(resumenes_parciales):
     }
 
   try:
-    return json.loads(respuesta.text)
+    return json.loads(respuesta_texto)
   except json.JSONDecodeError:
     return {
-        "resumen": respuesta.text,
+        "resumen": respuesta_texto,
         "temas_principales": [],
         "decisiones": [],
         "preguntas_y_respuestas": [],
@@ -279,7 +262,7 @@ def generar_resumen_final(resumenes_parciales):
 def generar_resumen_inteligente(texto):
     tokens_estimados = estimar_tokens(texto)
 
-    if tokens_estimados <= MAX_TOKENS_GEMINI:
+    if tokens_estimados <= MAX_TOKENS_IA:
         return generar_resumen(texto)
 
     bloques = dividir_texto(texto)
@@ -351,48 +334,25 @@ def generar_resumen(texto):
       "CONVERSACIÓN:\n" + texto
   )
 
-  respuesta = None
-  for modelo in MODELOS_PREFERIDOS:
-    try:
-      print(f"Intentando con el modelo: {modelo}...")
-      respuesta = gemini_client.models.generate_content(
-          model=modelo,
-          contents=prompt,
-          config={"response_mime_type": "application/json"},
-      )
-      break  # Si tiene éxito, salimos del bucle
-    except ServerError:
-      print(
-          f"El modelo {modelo} está saturado. Esperando 2 segundos para"
-          " reintentar..."
-      )
-      time.sleep(2)  # Pausa breve antes de probar el siguiente modelo
-      continue  # Si da error 503, prueba con el siguiente modelo
-    except Exception as e:
-      print(f"Ocurrió un error: {e}")
-      continue
+  respuesta_texto = consultar_ia(prompt)
 
-  # Si ningún modelo respondió correctamente
-  if respuesta is None:
+  if respuesta_texto is None:
     return {
         "temas_principales": [],
         "decisiones": [
-            "⚠️ Los servidores están experimentando alta demanda (Error 503)."
-            " Inténtalo de nuevo."
+            "⚠️ Todos los modelos gratuitos de OpenRouter están experimentando alta demanda. Inténtalo de nuevo."
         ],
         "preguntas_y_respuestas": [],
     }
 
-  # Parseamos el texto devuelto a un diccionario de Python
   try:
-    return json.loads(respuesta.text)
+    return json.loads(respuesta_texto)
   except json.JSONDecodeError:
     return {
         "temas_principales": [],
-        "decisiones": [respuesta.text],
-        "preguntas_y_respuetas": [],
+        "decisiones": [respuesta_texto],
+        "preguntas_y_respuestas": [],
     }
-
 
 def filtrar_mensajes(messages):
     mensajes_filtrados = []
@@ -415,37 +375,10 @@ def estimar_tokens(texto):
 
 async def diagnosticar_chat(chat):
     print("\n========== DIAGNÓSTICO DEL CHAT ==========")
-
     print(f"Nombre: {chat.name}")
     print(f"ID: {chat.id}")
     print(f"Tipo: {type(chat.entity).__name__}")
-
     print(f"Unread count: {chat.unread_count}")
-
-    entity = chat.entity
-
-    print(f"Entity ID: {getattr(entity, 'id', None)}")
-    print(f"Username: {getattr(entity, 'username', None)}")
-    print(f"Title: {getattr(entity, 'title', None)}")
-    print(f"Megagroup: {getattr(entity, 'megagroup', None)}")
-    print(f"Broadcast: {getattr(entity, 'broadcast', None)}")
-
-    print("\nAtributos relacionados con topics/discusiones:")
-
-    atributos = [
-        "forum",
-        "linked_chat_id",
-        "discussion",
-        "megagroup",
-        "broadcast"
-    ]
-
-    for atributo in atributos:
-        print(
-            f"{atributo}: "
-            f"{getattr(entity, atributo, None)}"
-        )
-
     print("==========================================\n")
 
 async def obtener_topics(chat):
@@ -459,28 +392,23 @@ async def obtener_topics(chat):
             limit=100
         )
     )
-
     return resultado.topics
 
 async def error_handler(update, context):
     error = context.error
-
     print("ERROR:")
     traceback.print_exception(
         type(error),
         error,
         error.__traceback__
     )
-
     await enviar_error_telegram(update, error)
 
 async def obtener_mensajes_topic(chat, topic_id):
-
     mensajes = []
     offset_id = 0
 
     while True:
-
         resultado = await telegram_client(
             functions.messages.GetRepliesRequest(
                 peer=chat.entity,
@@ -506,13 +434,6 @@ async def obtener_mensajes_topic(chat, topic_id):
 
         mensajes.extend(nuevos)
 
-        print(
-            f"Mensajes recuperados del Topic: "
-            f"{len(mensajes)}"
-        )
-
-        # El último mensaje de este bloque
-        # será nuestro nuevo punto de paginación
         ultimo_id = resultado.messages[-1].id
 
         if ultimo_id == offset_id:
@@ -520,57 +441,18 @@ async def obtener_mensajes_topic(chat, topic_id):
 
         offset_id = ultimo_id
 
-        # Si hemos recibido menos de 100,
-        # probablemente hemos llegado al final
         if len(resultado.messages) < 100:
             break
 
-    # Evitar duplicados por seguridad
     mensajes_unicos = {
         mensaje.id: mensaje
         for mensaje in mensajes
     }
 
     mensajes = list(mensajes_unicos.values())
-
     mensajes.sort(key=lambda mensaje: mensaje.id)
 
     return mensajes
-
-
-async def diagnosticar_topic(chat, topic_id):
-    print("\n========== DIAGNÓSTICO DEL TOPIC ==========")
-    print(f"Chat ID: {chat.id}")
-    print(f"Topic ID: {topic_id}")
-
-    try:
-        resultado = await telegram_client(
-            functions.messages.GetRepliesRequest(
-                peer=chat.entity,
-                msg_id=topic_id,
-                offset_id=0,
-                offset_date=None,
-                add_offset=0,
-                limit=100,
-                max_id=0,
-                min_id=0,
-                hash=0
-            )
-        )
-
-        print(f"Mensajes recibidos: {len(resultado.messages)}")
-        print(f"Total indicado por Telegram: {getattr(resultado, 'count', 'desconocido')}")
-
-        for mensaje in resultado.messages:
-            print(
-                f"ID: {mensaje.id} | "
-                f"Texto: {(mensaje.message or '')[:100]}"
-            )
-
-    except Exception as e:
-        print(f"ERROR: {type(e).__name__}: {e}")
-
-    print("===========================================\n")
 
 async def seleccionar_chat(update, context):
     query = update.callback_query
@@ -582,11 +464,7 @@ async def seleccionar_chat(update, context):
         chat_id = int(partes[1])
         topic_id = int(partes[2])
 
-        print(f"Topic seleccionado: {topic_id}")
-        print(f"Chat seleccionado: {chat_id}")
-
         chat = None
-
         dialogs = await telegram_client.get_dialogs(limit=20)
 
         for dialog in dialogs:
@@ -605,15 +483,6 @@ async def seleccionar_chat(update, context):
         )
 
         mensajes = await obtener_mensajes_topic(chat, topic_id)
-
-        print(f"Mensajes obtenidos del Topic: {len(mensajes)}")
-
-        caracteres = sum(
-            len(mensaje.message)
-            for mensaje in mensajes
-        )
-
-        print(f"Caracteres: {caracteres}")
 
         await query.edit_message_text(
             f"✅ Topic encontrado\n\n"
@@ -684,8 +553,6 @@ async def seleccionar_chat(update, context):
         await query.edit_message_text(f"{chat.name}\n\nNo tienes mensajes sin leer.")
         return
 
-    print(f"Unread count: {chat.unread_count}")
-
     mensajes = []
 
     async for mensaje in telegram_client.iter_messages(
@@ -693,10 +560,8 @@ async def seleccionar_chat(update, context):
         limit=chat.unread_count
     ):
         mensajes.append(mensaje)
-    print(f"Mensajes obtenidos antes del filtro: {len(mensajes)}")
     
     mensajes.reverse()
-
     mensajes = filtrar_mensajes(mensajes)
 
     texto = ""
@@ -704,22 +569,13 @@ async def seleccionar_chat(update, context):
     for cadaMensaje in mensajes:
         texto += cadaMensaje.message.strip() + "\n\n"
 
-    tokens_estimados = estimar_tokens(texto)
-   
-    print(
-        f"Mensajes sin leer: {chat.unread_count} | "
-        f"Mensajes con texto: {len(mensajes)} | "
-        f"Caracteres enviados: {len(texto)} | "
-        f"Tokens estimados: {tokens_estimados}"
-    )
-
     await query.edit_message_text(
         "Estoy preparando el resumen..."
     )
 
-    if not GEMINI_ACTIVO:
+    if not IA_ACTIVA:
         await query.edit_message_text(
-            "⚠️ Gemini está desactivado temporalmente.\n\n"
+            "⚠️ Los sistemas de IA están desactivados temporalmente.\n\n"
             "La conversación se ha obtenido correctamente."
         )
         return
@@ -749,7 +605,23 @@ async def seleccionar_chat(update, context):
         mensaje += f"❓ {elemento['pregunta']}\n"
         mensaje += f"💬 {elemento['respuesta']}\n\n"
 
-    await query.edit_message_text(mensaje)
+    LIMITE_TELEGRAM = 4000 # Margen de seguridad por debajo de los 4096
+
+    if len(mensaje) <= LIMITE_TELEGRAM:
+        await query.edit_message_text(mensaje)
+    else:
+        # Divide el mensaje en partes según el límite
+        fragmentos = [mensaje[i:i + LIMITE_TELEGRAM] for i in range(0, len(mensaje), LIMITE_TELEGRAM)]
+        
+        # El primer fragmento edita el texto previo de "Estoy preparando el resumen..."
+        await query.edit_message_text(fragmentos[0])
+        
+        # Los siguientes fragmentos se envían como mensajes nuevos
+        for fragmento in fragmentos[1:]:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text=fragmento
+            )
 
 
 async def main():
@@ -765,7 +637,7 @@ async def main():
 
     app.add_handler(CallbackQueryHandler(seleccionar_chat))
 
-    print("Bot iniciado...")
+    print("Bot iniciado con soporte multimodelo gratuito de OpenRouter...")
 
     await app.initialize()
     await app.start()
