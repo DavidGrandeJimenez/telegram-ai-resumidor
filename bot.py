@@ -14,6 +14,8 @@ from telethon.sessions import StringSession
 import time
 from openai import OpenAI
 
+import re
+
 load_dotenv()
 
 # Lista ampliada de modelos gratuitos en OpenRouter con rotación automática por saturación
@@ -81,6 +83,48 @@ async def enviar_error_telegram(update, error):
 
     except Exception as error_envio:
         print(f"No se pudo enviar el error a Telegram: {error_envio}")
+
+
+def limpiar_y_extraer_json(texto_respuesta):
+    if not texto_respuesta:
+        return {
+            "temas_principales": [],
+            "decisiones": ["⚠️ La IA no devolvió ninguna respuesta."],
+            "preguntas_y_respuestas": []
+        }
+        
+    # 1. Eliminar por completo los bloques de razonamiento (<think>...</think>) si el modelo los usa
+    texto_limpio = re.sub(r'<think>.*?</think>', '', texto_respuesta, flags=re.DOTALL).strip()
+    
+    # 2. Intentar parsear directamente si ya es un JSON válido
+    try:
+        return json.loads(texto_limpio)
+    except json.JSONDecodeError:
+        pass
+        
+    # 3. Si la IA añadió bloques Markdown (ej. ```json ... ```), extraer lo de dentro
+    match_markdown = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', texto_limpio, re.DOTALL)
+    if match_markdown:
+        try:
+            return json.loads(match_markdown.group(1))
+        except json.JSONDecodeError:
+            pass
+            
+    # 4. Intentar buscar la primera llave '{' y la última '}' del texto global
+    match_chaves = re.search(r'(\{.*\})', texto_limpio, re.DOTALL)
+    if match_chaves:
+        try:
+            return json.loads(match_chaves.group(1))
+        except json.JSONDecodeError:
+            pass
+            
+    # 5. Si todo falla, devolvemos un diccionario seguro para que el bot no pete
+    return {
+        "temas_principales": [],
+        "decisiones": [texto_limpio[:400] if texto_limpio else "⚠️ Error al interpretar la respuesta de la IA."],
+        "preguntas_y_respuestas": []
+    }
+
 
 async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dialogs = await telegram_client.get_dialogs(limit=20)
@@ -191,7 +235,7 @@ def generar_resumen_parcial(texto):
     }
 
   try:
-    return json.loads(respuesta_texto)
+    return limpiar_y_extraer_json(respuesta_texto)
   except json.JSONDecodeError:
     return {
         "resumen": respuesta_texto,
@@ -250,7 +294,7 @@ def generar_resumen_final(resumenes_parciales):
     }
 
   try:
-    return json.loads(respuesta_texto)
+    return limpiar_y_extraer_json(respuesta_texto)
   except json.JSONDecodeError:
     return {
         "resumen": respuesta_texto,
@@ -346,7 +390,7 @@ def generar_resumen(texto):
     }
 
   try:
-    return json.loads(respuesta_texto)
+    return limpiar_y_extraer_json(respuesta_texto)
   except json.JSONDecodeError:
     return {
         "temas_principales": [],
@@ -601,9 +645,19 @@ async def seleccionar_chat(update, context):
 
     mensaje += "\n🔹 PREGUNTAS Y RESPUESTAS\n\n"
 
-    for elemento in datos["preguntas_y_respuestas"]:
-        mensaje += f"❓ {elemento['pregunta']}\n"
-        mensaje += f"💬 {elemento['respuesta']}\n\n"
+    # Si la IA devuelve un formato extraño o no es una lista, evitamos que pete
+    if isinstance(datos.get("preguntas_y_respuestas"), list):
+        for elemento in datos["preguntas_y_respuestas"]:
+            if isinstance(elemento, dict):
+                pregunta = elemento.get('pregunta', 'Pregunta no especificada')
+                respuesta = elemento.get('respuesta', 'No se ha respondido.')
+                mensaje += f"❓ {pregunta}\n"
+                mensaje += f"💬 {respuesta}\n\n"
+
+    # Blindamos también los temas y decisiones por si acaso
+    if isinstance(datos.get("temas_principales"), list):
+        # (Asegúrate de mantener tu bucle de temas y decisiones arriba protegido también si lo deseas)
+        pass
 
     LIMITE_TELEGRAM = 4000 # Margen de seguridad por debajo de los 4096
 
